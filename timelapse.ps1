@@ -162,7 +162,13 @@ function Invoke-FFmpegWithFallback {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
-        [string[]]$BaseArgs,
+        [string[]]$InputArgs,
+        
+        [Parameter(Mandatory = $true)]
+        [string[]]$FilterArgs,
+        
+        [Parameter(Mandatory = $true)]
+        [string[]]$OutputArgs,
         
         [Parameter(Mandatory = $true)]
         [string]$OutputPath,
@@ -173,45 +179,121 @@ function Invoke-FFmpegWithFallback {
     
     Write-Verbose "Starting $Description"
     
-    # Try GPU encoding first
-    $gpuArgs = $BaseArgs + @(
-        '-c:v', $Script:Config.EncoderGPU,
-        '-preset', $Script:Config.PresetGPU,
-        '-cq', $Script:Config.CRF
-    )
-    
     $errorLogPath = Join-Path $env:TEMP "ffmpeg_error_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
+    $batchFile = Join-Path $env:TEMP "ffmpeg_cmd_$(Get-Date -Format 'yyyyMMdd_HHmmss').cmd"
     
+    # Try GPU encoding first
     Write-Verbose "  Attempting GPU encoding (NVENC)..."
+    
+    # Build command for batch file (no PowerShell escaping issues)
+    $batchContent = "@echo off`r`n"
+    $batchContent += "ffmpeg"
+    foreach ($arg in $InputArgs) {
+        # Don't quote switches, only values
+        if ($arg.StartsWith('-')) {
+            $batchContent += " $arg"
+        } else {
+            $batchContent += " `"$arg`""
+        }
+    }
+    foreach ($arg in $FilterArgs) {
+        if ($arg.StartsWith('-')) {
+            $batchContent += " $arg"
+        } else {
+            $batchContent += " `"$arg`""
+        }
+    }
+    $batchContent += " -c:v $($Script:Config.EncoderGPU)"
+    $batchContent += " -preset $($Script:Config.PresetGPU)"
+    $batchContent += " -cq $($Script:Config.CRF)"
+    foreach ($arg in $OutputArgs) {
+        if ($arg.StartsWith('-')) {
+            $batchContent += " $arg"
+        } else {
+            $batchContent += " `"$arg`""
+        }
+    }
+    $batchContent += " `"$OutputPath`""
+    $batchContent += " 2> `"$errorLogPath`""
+    
+    Set-Content -Path $batchFile -Value $batchContent -Encoding ASCII
+    Write-Verbose "  Batch file: $batchFile"
+    
     try {
-        $proc = Start-Process -FilePath 'ffmpeg' -ArgumentList $gpuArgs `
-            -NoNewWindow -Wait -PassThru `
-            -RedirectStandardError $errorLogPath -ErrorAction SilentlyContinue
+        & cmd /c $batchFile
+        $exitCode = $LASTEXITCODE
         
-        if ($proc.ExitCode -eq 0 -and (Test-Path $OutputPath)) {
+        if ($exitCode -eq 0 -and (Test-Path $OutputPath)) {
             Write-Verbose "  ✓ GPU encoding successful"
+            Remove-Item $batchFile -ErrorAction SilentlyContinue
             return $true
+        }
+        
+        # GPU encoding failed, show why
+        if (Test-Path $errorLogPath) {
+            $gpuError = Get-Content $errorLogPath -Raw
+            Write-Warning "GPU encoding failed with exit code $exitCode"
+            if ($gpuError -match "No NVENC capable devices found") {
+                Write-Warning "  Reason: No NVIDIA GPU detected or NVENC not available"
+                Write-Warning "  Solution: Install latest NVIDIA drivers or use a GPU that supports NVENC"
+            } elseif ($gpuError -match "Cannot load nvcuda.dll") {
+                Write-Warning "  Reason: NVIDIA CUDA library not found"
+                Write-Warning "  Solution: Install latest NVIDIA drivers"
+            } elseif ($gpuError -match "Unrecognized option") {
+                Write-Warning "  Reason: Your FFmpeg build doesn't support h264_nvenc"
+                Write-Warning "  Solution: Install FFmpeg with NVENC support"
+            } else {
+                Write-Verbose "  GPU Error details: $($gpuError.Substring(0, [Math]::Min(500, $gpuError.Length)))"
+            }
         }
     } catch {
         Write-Verbose "  GPU encoding failed: $($_.Exception.Message)"
     }
     
     # Fall back to CPU encoding
-    Write-Warning "GPU encoding unavailable or failed, using CPU encoding (this will be slower)..."
-    $cpuArgs = $BaseArgs + @(
-        '-c:v', $Script:Config.EncoderCPU,
-        '-preset', $Script:Config.PresetCPU,
-        '-crf', $Script:Config.CRF
-    )
-    
+    Write-Warning "Falling back to CPU encoding (this will be slower)..."
     Write-Verbose "  Attempting CPU encoding..."
-    $proc = Start-Process -FilePath 'ffmpeg' -ArgumentList $cpuArgs `
-        -NoNewWindow -Wait -PassThru `
-        -RedirectStandardError $errorLogPath
     
-    if ($proc.ExitCode -ne 0 -or -not (Test-Path $OutputPath)) {
+    $batchContent = "@echo off`r`n"
+    $batchContent += "ffmpeg"
+    foreach ($arg in $InputArgs) {
+        if ($arg.StartsWith('-')) {
+            $batchContent += " $arg"
+        } else {
+            $batchContent += " `"$arg`""
+        }
+    }
+    foreach ($arg in $FilterArgs) {
+        if ($arg.StartsWith('-')) {
+            $batchContent += " $arg"
+        } else {
+            $batchContent += " `"$arg`""
+        }
+    }
+    $batchContent += " -c:v $($Script:Config.EncoderCPU)"
+    $batchContent += " -preset $($Script:Config.PresetCPU)"
+    $batchContent += " -crf $($Script:Config.CRF)"
+    foreach ($arg in $OutputArgs) {
+        if ($arg.StartsWith('-')) {
+            $batchContent += " $arg"
+        } else {
+            $batchContent += " `"$arg`""
+        }
+    }
+    $batchContent += " `"$OutputPath`""
+    $batchContent += " 2> `"$errorLogPath`""
+    
+    Set-Content -Path $batchFile -Value $batchContent -Encoding ASCII
+    Write-Verbose "  Batch file: $batchFile"
+    
+    & cmd /c $batchFile
+    $exitCode = $LASTEXITCODE
+    
+    Remove-Item $batchFile -ErrorAction SilentlyContinue
+    
+    if ($exitCode -ne 0 -or -not (Test-Path $OutputPath)) {
         $errorContent = if (Test-Path $errorLogPath) { Get-Content $errorLogPath -Raw } else { "No error log available" }
-        throw "$Description failed. Exit code: $($proc.ExitCode)`nError log: $errorLogPath`n$errorContent"
+        throw "$Description failed. Exit code: $exitCode`nError log: $errorLogPath`n$errorContent"
     }
     
     Write-Verbose "  ✓ CPU encoding successful"
@@ -505,8 +587,11 @@ function Find-GpsMatchingClipSegment {
         }
         
         # Calculate combined score (lower is better)
-        # Weight timing error more heavily to prioritize duration accuracy
-        $combinedScore = $startDistance + $endDistance + ($timingError * 5.0)
+        # Heavily favor start coordinate accuracy for seamless transitions
+        # Start position is weighted 3x more than end position
+        # End position ensures we're following the correct path
+        # Timing is least important - just needs to be within tolerance
+        $combinedScore = ($startDistance * 3.0) + $endDistance + ($timingError * 0.1)
         
         if ($combinedScore -lt $bestScore) {
             $bestScore = $combinedScore
@@ -647,28 +732,33 @@ function Merge-VideosWithCrossfade {
     $videoFilter = "fps=$Fps,format=yuv420p,setsar=1,settb=AVTB"
     $filterComplex = "[0:v]$videoFilter,setpts=PTS-STARTPTS[va]; " +
                      "[1:v]$videoFilter,setpts=PTS-STARTPTS[vb]; " +
-                     "[va][vb]xfade=transition=fade:duration=$localFade:offset=$offset[v]"
-    
+                     "[va][vb]xfade=transition=fade:duration=$localFade" + ":offset=$offset[v]"
     Write-Verbose "Merging videos with crossfade:"
     Write-Verbose "  A: $(Split-Path $VideoA -Leaf) ($($DurationA)s)"
     Write-Verbose "  B: $(Split-Path $VideoB -Leaf) ($($DurationB)s)"
     Write-Verbose "  Fade: $($localFade)s at offset $($offset)s"
     
-    # Build FFmpeg arguments
-    $baseArgs = @(
+    # Build FFmpeg arguments in separate groups
+    $inputArgs = @(
         '-y',
         '-i', $VideoA,
-        '-i', $VideoB,
+        '-i', $VideoB
+    )
+    
+    $filterArgs = @(
         '-filter_complex', $filterComplex,
-        '-map', '[v]',
+        '-map', '[v]'
+    )
+    
+    $outputArgs = @(
         '-pix_fmt', 'yuv420p',
         '-movflags', '+faststart',
-        '-fps_mode', 'vfr',
-        $OutputPath
+        '-fps_mode', 'vfr'
     )
     
     # Execute with GPU/CPU fallback
-    Invoke-FFmpegWithFallback -BaseArgs $baseArgs -OutputPath $OutputPath `
+    Invoke-FFmpegWithFallback -InputArgs $inputArgs -FilterArgs $filterArgs `
+        -OutputArgs $outputArgs -OutputPath $OutputPath `
         -Description "Video merge with crossfade" | Out-Null
     
     # Get final duration
@@ -1014,15 +1104,15 @@ try {
     # ============================================================================
     # AUDIO OVERLAY PHASE
     # ============================================================================
-    
+
     Write-Host "`n=== Adding Audio Overlay ===" -ForegroundColor Cyan
-    
+
     $musicFolder = Join-Path $outputFolder 'music'
     $outputFileNoAudio = Join-Path $outputFolder "$($outputBaseName)_noaudio.mp4"
-    
+
     # Copy merged video first
     Copy-Item -LiteralPath $currentVideoPath -Destination $outputFileNoAudio -Force
-    
+
     if (Test-Path $musicFolder -PathType Container) {
         $mp3Files = Get-ChildItem -Path $musicFolder -Filter '*.mp3' -File
         
@@ -1039,35 +1129,51 @@ try {
                 
                 $fadeOutStart = [Math]::Max(0, $currentDuration - $Script:Config.AudioFadeOutDuration)
                 
-                $audioFilterComplex = "[1:a]aloop=loop=$loops`:size=2e+09,atrim=end=$currentDuration," +
-                    "afade=t=in:st=0:d=$($Script:Config.AudioFadeInDuration)," +
-                    "afade=t=out:st=$fadeOutStart`:d=$($Script:Config.AudioFadeOutDuration)[aout]"
-                
-                $audioArgs = @(
-                    '-y',
-                    '-i', $outputFileNoAudio,
-                    '-stream_loop', '-1',
-                    '-i', $randomMp3.FullName,
-                    '-filter_complex', $audioFilterComplex,
-                    '-map', '0:v:0',
-                    '-map', '[aout]',
-                    '-c:v', 'copy',
-                    '-c:a', 'aac',
-                    '-b:a', $Script:Config.AudioBitrate,
-                    '-shortest',
-                    $outputFile
-                )
+                # Build filter string
+                $audioFilter = "[1:a]aloop=loop=${loops}:size=2e+09,atrim=end=${currentDuration},afade=t=in:st=0:d=$($Script:Config.AudioFadeInDuration),afade=t=out:st=${fadeOutStart}:d=$($Script:Config.AudioFadeOutDuration)[aout]"
                 
                 Write-Host "Applying audio with fade in/out..." -NoNewline
                 
-                $proc = Start-Process -FilePath 'ffmpeg' -ArgumentList $audioArgs `
-                    -NoNewWindow -Wait -PassThru -RedirectStandardError "$env:TEMP\ffmpeg_audio.txt"
+                $audioErrorLog = Join-Path $env:TEMP "ffmpeg_audio_error.txt"
                 
-                if ($proc.ExitCode -eq 0 -and (Test-Path $outputFile)) {
+                # Use native PowerShell call operator with proper quoting
+                $ffmpegExe = (Get-Command ffmpeg).Source
+                
+                & $ffmpegExe -y `
+                    -i "$outputFileNoAudio" `
+                    -stream_loop -1 `
+                    -i "$($randomMp3.FullName)" `
+                    -filter_complex "$audioFilter" `
+                    -map "0:v:0" `
+                    -map "[aout]" `
+                    -c:v copy `
+                    -c:a aac `
+                    -b:a $Script:Config.AudioBitrate `
+                    -shortest `
+                    "$outputFile" `
+                    2> $audioErrorLog
+                
+                $exitCode = $LASTEXITCODE
+                
+                if ($exitCode -eq 0 -and (Test-Path $outputFile)) {
                     Write-Host " ✓" -ForegroundColor Green
                     Remove-Item -LiteralPath $outputFileNoAudio -Force -ErrorAction SilentlyContinue
+                    Remove-Item $audioErrorLog -ErrorAction SilentlyContinue
                 } else {
-                    Write-Warning "Audio overlay failed, keeping video without audio"
+                    Write-Host "" # newline
+                    Write-Warning "Audio overlay failed (exit code: $exitCode)"
+                    
+                    if (Test-Path $audioErrorLog) {
+                        $errorContent = Get-Content $audioErrorLog -Raw
+                        Write-Warning "FFmpeg error output:"
+                        Write-Warning $errorContent
+                    }
+                    
+                    Write-Host "Keeping video without audio: $outputFileNoAudio" -ForegroundColor Yellow
+                    
+                    if (Test-Path $outputFile) {
+                        Remove-Item $outputFile -Force
+                    }
                     Copy-Item -LiteralPath $outputFileNoAudio -Destination $outputFile -Force
                 }
             } catch {
@@ -1107,9 +1213,6 @@ try {
         Write-Host "  $tempClipsDir"
         Write-Host "  $tempMergeDir"
     }
-    
-    Write-Host "`nTo upload to YouTube, use:" -ForegroundColor Cyan
-    Write-Host "  .\upload-youtube.ps1 -VideoFile '$outputFile' -YouTubeVideoId 'YOUR_VIDEO_ID' -YouTubeAccessToken 'YOUR_TOKEN'"
     
 } catch {
     Write-Error "Fatal error: $($_.Exception.Message)"
