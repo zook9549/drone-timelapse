@@ -26,6 +26,11 @@
 .PARAMETER KeepTemps
     If specified, temporary directories will be kept after processing for debugging.
 
+.PARAMETER MasterVideo
+    Name of the video file to use as the master reference (e.g., 'video1.mp4').
+    If not specified, uses the first video by date/time. The master video determines
+    the GPS timeline that other videos will match against.
+
 .EXAMPLE
     .\timelapse.ps1 -InputFolder "C:\Videos\Trip01"
     
@@ -35,6 +40,11 @@
     .\timelapse.ps1 -InputFolder "C:\Videos\Trip01" -ClipLengthSec 3 -FadeDurationSec 0.5 -Fps 60
     
     Creates a timelapse with 3-second clips, 0.5-second fades, at 60fps.
+
+.EXAMPLE
+    .\timelapse.ps1 -InputFolder "C:\Videos\Trip01" -MasterVideo "GX010123.mp4"
+    
+    Creates a timelapse using GX010123.mp4 as the master reference video.
 
 .NOTES
     Requires: FFmpeg and FFprobe in PATH
@@ -66,13 +76,20 @@ param(
     [int]$Fps = 30,
 
     [Parameter(HelpMessage = "Keep temporary files for debugging")]
-    [switch]$KeepTemps
+    [switch]$KeepTemps,
+
+    [Parameter(HelpMessage = "Name of the video file to use as master reference (e.g., 'video1.mp4'). If not specified, uses the first video by date/time.")]
+    [string]$MasterVideo
 )
 
 #Requires -Version 7.0
 
 $ErrorActionPreference = 'Stop'
 $ci = [System.Globalization.CultureInfo]::InvariantCulture
+
+# Import shared GPS scoring functions
+$scriptPath = Split-Path -Parent $MyInvocation.MyCommand.Path
+. (Join-Path $scriptPath "GpsScoring.ps1")
 
 # ============================================================================
 # CONFIGURATION CONSTANTS
@@ -81,8 +98,8 @@ $ci = [System.Globalization.CultureInfo]::InvariantCulture
 $Script:Config = @{
     # GPS matching thresholds
     MaxDistanceMeters     = 30.0    # Maximum distance in meters for GPS coordinate matching
-    SearchWindowHalfSec   = 5.0     # Time window half-width for searching GPS points (seconds)
-    MaxTimingErrorSec     = 3.0     # Maximum allowed timing error for clip duration matching
+    SearchWindowHalfSec   = 10.0     # Time window half-width for searching GPS points (seconds)
+    MaxTimingErrorSec     = 10.0     # Maximum allowed timing error for clip duration matching
     
     # Safety limits
     MaxClipCount          = 200     # Maximum number of clips to extract
@@ -100,7 +117,7 @@ $Script:Config = @{
     EncoderCPU            = 'libx264'     # CPU fallback encoder
     PresetGPU             = 'p4'          # GPU encoding preset
     PresetCPU             = 'faster'      # CPU encoding preset
-    CRF                   = 23            # Constant Rate Factor for quality
+    CRF                   = 18            # Constant Rate Factor for quality (18 = visually lossless)
     
     # Validation
     MinGPSPoints          = 3       # Minimum GPS points required in SRT file
@@ -164,8 +181,8 @@ function Invoke-FFmpegWithFallback {
         [Parameter(Mandatory = $true)]
         [string[]]$InputArgs,
         
-        [Parameter(Mandatory = $true)]
-        [string[]]$FilterArgs,
+        [Parameter(Mandatory = $false)]
+        [string[]]$FilterArgs = @(),
         
         [Parameter(Mandatory = $true)]
         [string[]]$OutputArgs,
@@ -430,187 +447,8 @@ function Get-SrtGpsPoints {
     }
 }
 
-# ============================================================================
-# HELPER FUNCTIONS - GPS CALCULATIONS
-# ============================================================================
-
-function Get-HaversineDistance {
-    <#
-    .SYNOPSIS
-        Calculates distance between two GPS coordinates using Haversine formula.
-    .DESCRIPTION
-        Returns distance in meters between two points on Earth's surface.
-    #>
-    [CmdletBinding()]
-    [OutputType([double])]
-    param(
-        [Parameter(Mandatory = $true)]
-        [double]$Lat1,
-        
-        [Parameter(Mandatory = $true)]
-        [double]$Lon1,
-        
-        [Parameter(Mandatory = $true)]
-        [double]$Lat2,
-        
-        [Parameter(Mandatory = $true)]
-        [double]$Lon2
-    )
-    
-    $earthRadiusMeters = 6371000.0
-    $toRadians = [Math]::PI / 180.0
-    
-    # Convert to radians and calculate deltas
-    $dLat = ($Lat2 - $Lat1) * $toRadians
-    $dLon = ($Lon2 - $Lon1) * $toRadians
-    $lat1Rad = $Lat1 * $toRadians
-    $lat2Rad = $Lat2 * $toRadians
-    
-    # Haversine formula
-    $a = [Math]::Pow([Math]::Sin($dLat / 2), 2) + 
-         [Math]::Cos($lat1Rad) * [Math]::Cos($lat2Rad) * 
-         [Math]::Pow([Math]::Sin($dLon / 2), 2)
-    
-    $c = 2 * [Math]::Atan2([Math]::Sqrt($a), [Math]::Sqrt(1 - $a))
-    
-    return $earthRadiusMeters * $c
-}
-
-function Get-NearestGpsPoint {
-    <#
-    .SYNOPSIS
-        Finds GPS point closest to specified time.
-    #>
-    [CmdletBinding()]
-    [OutputType([object])]
-    param(
-        [Parameter(Mandatory = $true)]
-        [System.Collections.Generic.List[object]]$GpsPoints,
-        
-        [Parameter(Mandatory = $true)]
-        [double]$TargetTime
-    )
-    
-    $bestPoint = $null
-    $bestTimeDiff = [double]::PositiveInfinity
-    
-    foreach ($point in $GpsPoints) {
-        $timeDiff = [Math]::Abs($point.t - $TargetTime)
-        if ($timeDiff -lt $bestTimeDiff) {
-            $bestTimeDiff = $timeDiff
-            $bestPoint = $point
-        }
-    }
-    
-    return $bestPoint
-}
-
-function Find-GpsMatchingClipSegment {
-    <#
-    .SYNOPSIS
-        Finds video segment matching target GPS coordinates at both start and end.
-    .DESCRIPTION
-        Searches for a clip segment where both the starting and ending GPS positions
-        match the target coordinates within specified distance and timing thresholds.
-    #>
-    [CmdletBinding()]
-    [OutputType([hashtable])]
-    param(
-        [Parameter(Mandatory = $true)]
-        [System.Collections.Generic.List[object]]$GpsPoints,
-        
-        [Parameter(Mandatory = $true)]
-        [double]$TargetStartLat,
-        
-        [Parameter(Mandatory = $true)]
-        [double]$TargetStartLon,
-        
-        [Parameter(Mandatory = $true)]
-        [double]$TargetEndLat,
-        
-        [Parameter(Mandatory = $true)]
-        [double]$TargetEndLon,
-        
-        [Parameter(Mandatory = $true)]
-        [double]$ClipDuration,
-        
-        [Parameter(Mandatory = $true)]
-        [double]$SearchWindowStart,
-        
-        [Parameter(Mandatory = $true)]
-        [double]$SearchWindowEnd,
-        
-        [Parameter(Mandatory = $true)]
-        [double]$MaxDistanceMeters,
-        
-        [Parameter(Mandatory = $true)]
-        [double]$MaxTimingErrorSec
-    )
-    
-    $bestMatch = $null
-    $bestScore = [double]::PositiveInfinity
-    
-    foreach ($startPoint in $GpsPoints) {
-        # Filter by time window
-        if ($startPoint.t -lt $SearchWindowStart -or $startPoint.t -gt $SearchWindowEnd) {
-            continue
-        }
-        
-        # Check start position match
-        $startDistance = Get-HaversineDistance -Lat1 $TargetStartLat -Lon1 $TargetStartLon `
-            -Lat2 $startPoint.lat -Lon2 $startPoint.lon
-        
-        if ($startDistance -gt $MaxDistanceMeters) {
-            continue
-        }
-        
-        # Find expected end point
-        $expectedEndTime = $startPoint.t + $ClipDuration
-        $endPoint = Get-NearestGpsPoint -GpsPoints $GpsPoints -TargetTime $expectedEndTime
-        
-        if (-not $endPoint) {
-            continue
-        }
-        
-        # Check timing tolerance
-        $timingError = [Math]::Abs($endPoint.t - $expectedEndTime)
-        if ($timingError -gt $MaxTimingErrorSec) {
-            continue
-        }
-        
-        # Check end position match
-        $endDistance = Get-HaversineDistance -Lat1 $TargetEndLat -Lon1 $TargetEndLon `
-            -Lat2 $endPoint.lat -Lon2 $endPoint.lon
-        
-        if ($endDistance -gt $MaxDistanceMeters) {
-            continue
-        }
-        
-        # Calculate combined score (lower is better)
-        # Heavily favor start coordinate accuracy for seamless transitions
-        # Start position is weighted 3x more than end position
-        # End position ensures we're following the correct path
-        # Timing is least important - just needs to be within tolerance
-        $combinedScore = ($startDistance * 3.0) + $endDistance + ($timingError * 0.1)
-        
-        if ($combinedScore -lt $bestScore) {
-            $bestScore = $combinedScore
-            $bestMatch = @{
-                StartPoint      = $startPoint
-                EndPoint        = $endPoint
-                StartDistance   = $startDistance
-                EndDistance     = $endDistance
-                TimingError     = $timingError
-                ClipStart       = $startPoint.t
-                ClipEnd         = $endPoint.t
-                ClipDuration    = $endPoint.t - $startPoint.t
-                CombinedScore   = $combinedScore
-            }
-        }
-    }
-    
-    return $bestMatch
-}
+# Note: GPS calculation functions (Get-HaversineDistance, Get-NearestGpsPoint, Find-GpsMatchingClipSegment)
+# are now imported from GpsScoring.ps1
 
 # ============================================================================
 # HELPER FUNCTIONS - VIDEO OPERATIONS
@@ -756,10 +594,41 @@ function Merge-VideosWithCrossfade {
         '-fps_mode', 'vfr'
     )
     
-    # Execute with GPU/CPU fallback
-    Invoke-FFmpegWithFallback -InputArgs $inputArgs -FilterArgs $filterArgs `
-        -OutputArgs $outputArgs -OutputPath $OutputPath `
-        -Description "Video merge with crossfade" | Out-Null
+    # For intermediate merges, use high quality encoding
+    Write-Verbose "  Using high quality H.264 for intermediate merge"
+    
+    # Use batch file approach to avoid argument escaping issues with complex filter strings
+    $batchFile = Join-Path $env:TEMP "ffmpeg_merge_$(Get-Date -Format 'yyyyMMdd_HHmmss').cmd"
+    $errorLog = Join-Path $env:TEMP "ffmpeg_merge_error.txt"
+    
+    $batchContent = "@echo off`r`n"
+    $batchContent += "ffmpeg -y"
+    $batchContent += " -i `"$VideoA`""
+    $batchContent += " -i `"$VideoB`""
+    $batchContent += " -filter_complex `"$filterComplex`""
+    $batchContent += " -map `"[v]`""
+    $batchContent += " -pix_fmt yuv420p"
+    $batchContent += " -c:v libx264"
+    $batchContent += " -preset veryfast"
+    $batchContent += " -crf 18"
+    $batchContent += " -movflags +faststart"
+    $batchContent += " -fps_mode vfr"
+    $batchContent += " `"$OutputPath`""
+    $batchContent += " 2> `"$errorLog`""
+    
+    Set-Content -Path $batchFile -Value $batchContent -Encoding ASCII
+    
+    & cmd /c $batchFile
+    $exitCode = $LASTEXITCODE
+    
+    Remove-Item $batchFile -ErrorAction SilentlyContinue
+    
+    if ($exitCode -ne 0 -or -not (Test-Path $OutputPath)) {
+        $errorContent = if (Test-Path $errorLog) { Get-Content $errorLog -Raw } else { "No error log" }
+        throw "Video merge with crossfade failed. Exit code: $exitCode`nError: $errorContent"
+    }
+    
+    Remove-Item $errorLog -ErrorAction SilentlyContinue
     
     # Get final duration
     $newDuration = Get-VideoExactDuration -VideoPath $OutputPath
@@ -834,11 +703,66 @@ try {
         throw "No valid video files with GPS data found."
     }
     
-    # Use first video as master reference
-    $masterVideo = $videoMetadata[0]
-    $totalDuration = [Math]::Floor($masterVideo.EffectiveMax)
+    # Select master reference video
+    if ($MasterVideo) {
+        Write-Verbose "Looking for specified master video: $MasterVideo"
+        
+        # Debug: show what we're searching for
+        Write-Verbose "Searching in $($videoMetadata.Count) loaded videos"
+        foreach ($v in $videoMetadata) {
+            Write-Verbose "  Available: '$($v.Name)'"
+        }
+        
+        # Find the matching video using explicit loop to avoid pipeline issues
+        # IMPORTANT: Use different variable name to avoid PowerShell case-insensitive collision with $MasterVideo parameter!
+        $selectedMasterVideo = $null
+        $searchName = $MasterVideo  # Create local copy to avoid any parameter issues
+        Write-Verbose "Searching for: '$searchName'"
+        
+        foreach ($v in $videoMetadata) {
+            Write-Verbose "  Comparing '$($v.Name)' with '$searchName'"
+            if ($v.Name -eq $searchName) {
+                Write-Verbose "  MATCH FOUND!"
+                $selectedMasterVideo = $v
+                break
+            }
+        }
+        
+        if (-not $selectedMasterVideo) {
+            Write-Warning "Specified master video '$searchName' not found in the loaded videos."
+            Write-Warning "Available videos:"
+            foreach ($v in $videoMetadata) {
+                Write-Warning "  - $($v.Name)"
+            }
+            throw "Master video not found: $searchName"
+        }
+        Write-Host "`nUsing specified master reference: $($selectedMasterVideo.Name)" -ForegroundColor Cyan
+    } else {
+        # Use first video (by date/time) as master reference
+        $selectedMasterVideo = $videoMetadata[0]
+        Write-Host "`nUsing first video as master reference: $($selectedMasterVideo.Name)" -ForegroundColor Cyan
+    }
     
-    Write-Host "`nMaster reference: $($masterVideo.Name)" -ForegroundColor Cyan
+    # Validate master video has required data
+    if (-not $selectedMasterVideo) {
+        throw "Master video object is null"
+    }
+    
+    if (-not $selectedMasterVideo.Name) {
+        Write-Warning "Master video Name property is empty or null"
+        Write-Warning "Master video type: $($selectedMasterVideo.GetType().FullName)"
+        Write-Warning "Master video properties: $($selectedMasterVideo | Get-Member -MemberType Properties | Select-Object -ExpandProperty Name)"
+        throw "Invalid master video object - Name is empty"
+    }
+    
+    if ($selectedMasterVideo.EffectiveMax -le 0) {
+        Write-Warning "Master video '$($selectedMasterVideo.Name)' has invalid EffectiveMax: $($selectedMasterVideo.EffectiveMax)"
+        Write-Warning "  Duration: $($selectedMasterVideo.Duration)"
+        Write-Warning "  GPS Points: $($selectedMasterVideo.GpsPoints.Count)"
+        throw "Invalid master video object - EffectiveMax is $($selectedMasterVideo.EffectiveMax)"
+    }
+    
+    $totalDuration = [Math]::Floor($selectedMasterVideo.EffectiveMax)
     Write-Host "Usable duration: $totalDuration seconds"
     
     # Setup output paths
@@ -868,10 +792,8 @@ try {
     
     $extractedClips = New-Object System.Collections.Generic.List[object]
     $clipCounter = 0
-    $roundRobinIndex = 0
     $masterTimePosition = 0.0
     $videoTimePositions = @{}
-    $lastUsedVideoIndex = 0
     $previousClipEndGps = $null
     $previousClipVideo = $null
     $previousClipEndTime = 0.0
@@ -880,6 +802,19 @@ try {
     foreach ($vmeta in $videoMetadata) {
         $videoTimePositions[$vmeta.Name] = 0.0
     }
+    
+    # Start round-robin with the master video
+    $masterVideoIndex = 0
+    for ($i = 0; $i -lt $videoMetadata.Count; $i++) {
+        if ($videoMetadata[$i].Name -eq $selectedMasterVideo.Name) {
+            $masterVideoIndex = $i
+            break
+        }
+    }
+    $roundRobinIndex = $masterVideoIndex
+    $lastUsedVideoIndex = $masterVideoIndex
+    
+    Write-Verbose "Round-robin starting with video index $masterVideoIndex ($($selectedMasterVideo.Name))"
     
     $attemptCounter = 0
     
@@ -893,18 +828,19 @@ try {
         # Determine target GPS coordinates
         if ($clipCounter -eq 0) {
             # First clip: use master timeline
-            $targetStartPos = Get-NearestGpsPoint -GpsPoints $masterVideo.GpsPoints -TargetTime $masterTimePosition
+            $targetStartPos = Get-NearestGpsPoint -GpsPoints $selectedMasterVideo.GpsPoints -TargetTime $masterTimePosition
             $targetEndTime = [Math]::Min($masterTimePosition + $ClipLengthSec, $totalDuration)
-            $targetEndPos = Get-NearestGpsPoint -GpsPoints $masterVideo.GpsPoints -TargetTime $targetEndTime
+            $targetEndPos = Get-NearestGpsPoint -GpsPoints $selectedMasterVideo.GpsPoints -TargetTime $targetEndTime
             
             Write-Host "`nClip #1 (from master): GPS Start($($targetStartPos.lat.ToString('N6')), $($targetStartPos.lon.ToString('N6'))) End($($targetEndPos.lat.ToString('N6')), $($targetEndPos.lon.ToString('N6')))"
         } else {
-            # Subsequent clips: continue from where previous clip ended
+            # Subsequent clips: use master video timeline to prevent error cascading
             $targetStartPos = $previousClipEndGps
-            $expectedEndTimeInPrevVideo = $previousClipEndTime + $ClipLengthSec
-            $targetEndPos = Get-NearestGpsPoint -GpsPoints $previousClipVideo.GpsPoints -TargetTime $expectedEndTimeInPrevVideo
+            # Calculate target end time from master timeline (not previous clip's video)
+            $targetEndTime = [Math]::Min($masterTimePosition + $ClipLengthSec, $totalDuration)
+            $targetEndPos = Get-NearestGpsPoint -GpsPoints $selectedMasterVideo.GpsPoints -TargetTime $targetEndTime
             
-            Write-Host "`nClip #$($clipCounter + 1) (continuing from $($previousClipVideo.Name)): GPS Start($($targetStartPos.lat.ToString('N6')), $($targetStartPos.lon.ToString('N6'))) End($($targetEndPos.lat.ToString('N6')), $($targetEndPos.lon.ToString('N6')))"
+            Write-Host "`nClip #$($clipCounter + 1) (from master timeline): GPS Start($($targetStartPos.lat.ToString('N6')), $($targetStartPos.lon.ToString('N6'))) End($($targetEndPos.lat.ToString('N6')), $($targetEndPos.lon.ToString('N6')))"
         }
         
         # Round-robin video selection
@@ -927,23 +863,59 @@ try {
             $searchStart = [Math]::Max($videoCurrentPos, $expectedStart - $Script:Config.SearchWindowHalfSec)
             $searchEnd = [Math]::Min($vmeta.EffectiveMax, $expectedStart + $Script:Config.SearchWindowHalfSec)
             
-            # Find matching clip segment
-            $clipMatch = Find-GpsMatchingClipSegment `
-                -GpsPoints $vmeta.GpsPoints `
-                -TargetStartLat $targetStartPos.lat -TargetStartLon $targetStartPos.lon `
-                -TargetEndLat $targetEndPos.lat -TargetEndLon $targetEndPos.lon `
-                -ClipDuration $ClipLengthSec `
-                -SearchWindowStart $searchStart -SearchWindowEnd $searchEnd `
-                -MaxDistanceMeters $Script:Config.MaxDistanceMeters `
-                -MaxTimingErrorSec $Script:Config.MaxTimingErrorSec
+            # Find matching clip segment (using shared GPS scoring function)
+            # For clips after the first, pass fade duration to ensure GPS continuity during crossfade
+            $clipMatchParams = @{
+                GpsPoints         = $vmeta.GpsPoints
+                TargetStartLat    = $targetStartPos.lat
+                TargetStartLon    = $targetStartPos.lon
+                TargetEndLat      = $targetEndPos.lat
+                TargetEndLon      = $targetEndPos.lon
+                ClipDuration      = $ClipLengthSec
+                SearchWindowStart = $searchStart
+                SearchWindowEnd   = $searchEnd
+            }
+            
+            # Add fade overlap for clips after the first to ensure seamless GPS continuity
+            # Also add master timeline GPS position for deviation scoring
+            if ($clipCounter -gt 0) {
+                $clipMatchParams['FadeOverlapDuration'] = $FadeDurationSec
+                # Pass master timeline end position for deviation penalty
+                # This balances smooth transitions with master path consistency
+                $masterTimelineEndPos = Get-NearestGpsPoint -GpsPoints $selectedMasterVideo.GpsPoints -TargetTime $targetEndTime
+                $clipMatchParams['MasterEndLat'] = $masterTimelineEndPos.lat
+                $clipMatchParams['MasterEndLon'] = $masterTimelineEndPos.lon
+            }
+            
+            $clipMatch = Find-GpsMatchingClipSegment @clipMatchParams
             
             if (-not $clipMatch) {
-                Write-Verbose "    No matching segment found (within $($Script:Config.MaxDistanceMeters)m, $($Script:Config.MaxTimingErrorSec)s)"
+                Write-Verbose "    No matching segment found"
                 $roundRobinIndex++
                 $triesRemaining--
                 continue
             }
             
+            # Check if match is valid or just a failed attempt with details
+            if ($clipMatch.ContainsKey('IsValid') -and -not $clipMatch.IsValid) {
+                Write-Verbose "    Match failed: $($clipMatch.FailureReason)"
+                if ($clipMatch.ContainsKey('BestStartDistance')) {
+                    Write-Verbose "    Best distances: start=$($clipMatch.BestStartDistance.ToString('N1'))m, end=$($clipMatch.BestEndDistance.ToString('N1'))m"
+                }
+                $roundRobinIndex++
+                $triesRemaining--
+                continue
+            }
+            
+            # Check if it's a failed match with score details
+            if ($clipMatch.ContainsKey('IsValid') -and -not $clipMatch.IsValid -and $clipMatch.FailureReason) {
+                Write-Verbose "    Match rejected: $($clipMatch.FailureReason)"
+                Write-Verbose "    Score: $($clipMatch.CombinedScore.ToString('N1')) - Start: $($clipMatch.StartDistance.ToString('N1'))m, End: $($clipMatch.EndDistance.ToString('N1'))m"
+                $roundRobinIndex++
+                $triesRemaining--
+                continue
+            }
+            Write-Verbose "Combined Score for clip match: $($clipMatch.CombinedScore.ToString('N2'))"
             $extractStart = $clipMatch.ClipStart
             $extractDuration = [Math]::Max($clipMatch.ClipDuration, $Script:Config.MinExtractDuration)
             $actualEndTime = $clipMatch.ClipEnd
@@ -1000,17 +972,17 @@ try {
         Write-Host "  Extracting clip #$($clipCounter): $($selectedVideo.Name) t=$($extractStart.ToString('N2'))s dur=$($extractDuration.ToString('N2'))s" -ForegroundColor Gray
         
         try {
+            # Use high quality encoding for intermediate clips (balanced quality/size)
             $extractArgs = @(
                 '-y',
                 '-ss', $extractStart.ToString($ci),
                 '-i', $selectedVideo.File.FullName,
                 '-t', $extractDuration.ToString($ci),
-                '-vf', "fps=$Fps,format=yuv420p,setsar=1,settb=AVTB",
-                '-vsync', '0',
+                '-vf', "fps=$Fps,format=yuv420p,setsar=1",
+                '-c:v', 'libx264',
+                '-preset', 'veryfast',
+                '-crf', '18',
                 '-an',
-                '-c:v', $Script:Config.EncoderCPU,
-                '-preset', 'fast',
-                '-crf', $Script:Config.CRF,
                 $clipFile
             )
             
@@ -1102,16 +1074,48 @@ try {
     Write-Host "`nMerge complete! Total duration: $($currentDuration.ToString('N1'))s" -ForegroundColor Green
     
     # ============================================================================
+    # FINAL QUALITY ENCODE (BEFORE AUDIO)
+    # ============================================================================
+    
+    Write-Host "`n=== Final Quality Encode ===" -ForegroundColor Cyan
+    Write-Host "Converting from lossless intermediate to final quality..."
+    
+    # Encode the lossless merge to final quality BEFORE adding audio
+    $losslessMerge = $currentVideoPath
+    $outputFileNoAudio = Join-Path $outputFolder "$($outputBaseName)_noaudio.mp4"
+    
+    # Build final encode with GPU/CPU fallback
+    $inputArgs = @('-y', '-i', $losslessMerge)
+    $filterArgs = @()
+    $outputArgs = @(
+        '-pix_fmt', 'yuv420p',
+        '-movflags', '+faststart'
+    )
+    
+    try {
+        Invoke-FFmpegWithFallback -InputArgs $inputArgs -FilterArgs $filterArgs `
+            -OutputArgs $outputArgs -OutputPath $outputFileNoAudio `
+            -Description "Final quality encode" | Out-Null
+        
+        Write-Host "  ✓ Final encode complete" -ForegroundColor Green
+        
+        # Update current path and duration for audio overlay
+        $currentVideoPath = $outputFileNoAudio
+        $currentDuration = Get-VideoExactDuration -VideoPath $outputFileNoAudio
+    } catch {
+        Write-Warning "Final encode failed: $($_.Exception.Message)"
+        Write-Warning "Copying lossless output (file will be larger)"
+        Copy-Item -LiteralPath $losslessMerge -Destination $outputFileNoAudio -Force
+        $currentVideoPath = $outputFileNoAudio
+    }
+    
+    # ============================================================================
     # AUDIO OVERLAY PHASE
     # ============================================================================
 
     Write-Host "`n=== Adding Audio Overlay ===" -ForegroundColor Cyan
 
     $musicFolder = Join-Path $outputFolder 'music'
-    $outputFileNoAudio = Join-Path $outputFolder "$($outputBaseName)_noaudio.mp4"
-
-    # Copy merged video first
-    Copy-Item -LiteralPath $currentVideoPath -Destination $outputFileNoAudio -Force
 
     if (Test-Path $musicFolder -PathType Container) {
         $mp3Files = Get-ChildItem -Path $musicFolder -Filter '*.mp3' -File

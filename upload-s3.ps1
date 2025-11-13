@@ -5,17 +5,17 @@
 
 .EXAMPLES
   # Upload a single file (key defaults to file name)
-  .\Upload-ToS3.ps1 -SourcePath "F:\fenton\timelapse\buildable.mp4" -Bucket "my-drone-archive"
+  .\Upload-ToS3.ps1 -SourcePath "\timelapse\buildable.mp4" -Bucket "my-drone-archive"
 
   # Upload single file to a specific key, set content-type and cache-control
   .\Upload-ToS3.ps1 -SourcePath "buildable.mp4" -Bucket "my-bucket" -Key "timelapse/buildable.mp4" `
     -ContentType "video/mp4" -CacheControl "public, max-age=31536000"
 
   # Upload entire folder (recursively) under a prefix, with AES256 server-side encryption
-  .\Upload-ToS3.ps1 -SourcePath "F:\fenton\timelapse\out" -Bucket "my-bucket" -KeyPrefix "timelapse/" -SSE AES256
+  .\Upload-ToS3.ps1 -SourcePath "\timelapse\out" -Bucket "my-bucket" -KeyPrefix "timelapse/" -SSE AES256
 
   # Upload using an AWS named profile and region, Intelligent Tiering storage class
-  .\Upload-ToS3.ps1 -SourcePath "F:\fenton\timelapse\buildable.mp4" -Bucket "my-bucket" `
+  .\Upload-ToS3.ps1 -SourcePath "\timelapse\buildable.mp4" -Bucket "my-bucket" `
     -Region "us-east-2" -Profile "default" -StorageClass INTELLIGENT_TIERING
 #>
 

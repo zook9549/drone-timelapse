@@ -24,15 +24,18 @@ This toolset enables you to:
 
 ### 1. Timelapse Creator (`timelapse.ps1`)
 
-Creates GPS-synchronized timelapse videos from multiple drone flights that follow consistent waypoint paths. By matching GPS coordinates, the script seamlessly merges footage from multiple flights into a single round-robin timelapse video.
+Creates GPS-synchronized timelapse videos from multiple drone flights that follow consistent waypoint paths. By matching GPS coordinates using a hybrid approach, the script seamlessly merges footage from multiple flights into a single round-robin timelapse video with smooth transitions while maintaining path consistency.
 
 #### Features
+- **Hybrid GPS Matching** - Balances smooth transitions with master timeline path adherence
 - Extracts clips from multiple drone videos in round-robin fashion
-- Matches GPS waypoints for seamless transitions between flights
-- Applies crossfade transitions between clips
+- Intelligent scoring system that considers start/end GPS accuracy, duration, and path deviation
+- Applies crossfade transitions with GPS continuity during fades
 - Adds optional random background music with fade in/out
-- GPU-accelerated encoding with automatic CPU fallback
+- GPU-accelerated encoding (NVENC) with automatic CPU fallback
+- High-quality output (CRF 18 - visually lossless)
 - Configurable clip length, fade duration, and frame rate
+- Optional master video selection for custom GPS timeline reference
 
 #### Usage
 
@@ -48,6 +51,9 @@ Creates GPS-synchronized timelapse videos from multiple drone flights that follo
 
 # Enable verbose output for troubleshooting
 .\timelapse.ps1 -InputFolder "C:\DroneFootage\Flight01" -Verbose
+
+# Use specific video as GPS timeline reference
+.\timelapse.ps1 -InputFolder "C:\DroneFootage\Flight01" -MasterVideo "GX010123.mp4"
 ```
 
 #### Parameters
@@ -58,6 +64,7 @@ Creates GPS-synchronized timelapse videos from multiple drone flights that follo
 | `ClipLengthSec` | Integer | 5 | Length of each clip in seconds (1-60) |
 | `FadeDurationSec` | Double | 1.0 | Duration of crossfade transitions (0.1-5.0) |
 | `Fps` | Integer | 30 | Output video frame rate (15-60) |
+| `MasterVideo` | String | *first video* | Name of video file to use as GPS timeline reference (e.g., 'GX010123.mp4') |
 | `KeepTemps` | Switch | False | Keep temporary files after processing |
 
 #### Input Requirements

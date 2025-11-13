@@ -27,7 +27,7 @@ foreach ($k in 'client_id','client_secret','refresh_token','token_uri') {
 }
 
 function Get-AccessToken {
-  param($cfg)
+  param($Cfg)
   $body = @{
     client_id     = $cfg.client_id
     client_secret = $cfg.client_secret
