@@ -1,0 +1,21 @@
+# Media files
+*.mp4
+*.mp3
+*.mov
+*.avi
+*.mkv
+*.wav
+*.flac
+*.m4a
+
+# Other common large binaries
+*.zip
+*.tar
+*.gz
+*.exe
+*.dll
+
+# Output/temp folders
+_*/
+_temp/
+processed/
