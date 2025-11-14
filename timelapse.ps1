@@ -79,7 +79,10 @@ param(
     [switch]$KeepTemps,
 
     [Parameter(HelpMessage = "Name of the video file to use as master reference (e.g., 'video1.mp4'). If not specified, uses the first video by date/time.")]
-    [string]$MasterVideo
+    [string]$MasterVideo,
+
+    [Parameter(HelpMessage = "Add timestamp watermark in lower right corner of each clip")]
+    [switch]$AddTimestamp
 )
 
 #Requires -Version 7.0
@@ -576,24 +579,6 @@ function Merge-VideosWithCrossfade {
     Write-Verbose "  B: $(Split-Path $VideoB -Leaf) ($($DurationB)s)"
     Write-Verbose "  Fade: $($localFade)s at offset $($offset)s"
     
-    # Build FFmpeg arguments in separate groups
-    $inputArgs = @(
-        '-y',
-        '-i', $VideoA,
-        '-i', $VideoB
-    )
-    
-    $filterArgs = @(
-        '-filter_complex', $filterComplex,
-        '-map', '[v]'
-    )
-    
-    $outputArgs = @(
-        '-pix_fmt', 'yuv420p',
-        '-movflags', '+faststart',
-        '-fps_mode', 'vfr'
-    )
-    
     # For intermediate merges, use high quality encoding
     Write-Verbose "  Using high quality H.264 for intermediate merge"
     
@@ -609,8 +594,8 @@ function Merge-VideosWithCrossfade {
     $batchContent += " -map `"[v]`""
     $batchContent += " -pix_fmt yuv420p"
     $batchContent += " -c:v libx264"
-    $batchContent += " -preset veryfast"
-    $batchContent += " -crf 18"
+    $batchContent += " -preset faster"
+    $batchContent += " -crf 12"
     $batchContent += " -movflags +faststart"
     $batchContent += " -fps_mode vfr"
     $batchContent += " `"$OutputPath`""
@@ -795,8 +780,6 @@ try {
     $masterTimePosition = 0.0
     $videoTimePositions = @{}
     $previousClipEndGps = $null
-    $previousClipVideo = $null
-    $previousClipEndTime = 0.0
     
     # Initialize time tracking for each video
     foreach ($vmeta in $videoMetadata) {
@@ -877,9 +860,11 @@ try {
             }
             
             # Add fade overlap for clips after the first to ensure seamless GPS continuity
+            # The GPS match should occur at the CENTER of the fade overlap
             # Also add master timeline GPS position for deviation scoring
             if ($clipCounter -gt 0) {
-                $clipMatchParams['FadeOverlapDuration'] = $FadeDurationSec
+                # GPS matching happens at the center of the fade (e.g., 0.5s for 1s fade)
+                $clipMatchParams['FadeOverlapDuration'] = $FadeDurationSec / 2.0
                 # Pass master timeline end position for deviation penalty
                 # This balances smooth transitions with master path consistency
                 $masterTimelineEndPos = Get-NearestGpsPoint -GpsPoints $selectedMasterVideo.GpsPoints -TargetTime $targetEndTime
@@ -972,24 +957,53 @@ try {
         Write-Host "  Extracting clip #$($clipCounter): $($selectedVideo.Name) t=$($extractStart.ToString('N2'))s dur=$($extractDuration.ToString('N2'))s" -ForegroundColor Gray
         
         try {
-            # Use high quality encoding for intermediate clips (balanced quality/size)
-            $extractArgs = @(
-                '-y',
-                '-ss', $extractStart.ToString($ci),
-                '-i', $selectedVideo.File.FullName,
-                '-t', $extractDuration.ToString($ci),
-                '-vf', "fps=$Fps,format=yuv420p,setsar=1",
-                '-c:v', 'libx264',
-                '-preset', 'veryfast',
-                '-crf', '18',
-                '-an',
-                $clipFile
-            )
+            # Build video filter with optional timestamp
+            $videoFilter = "fps=$Fps,format=yuv420p,setsar=1"
             
-            $proc = Start-Process -FilePath 'ffmpeg' -ArgumentList $extractArgs `
-                -NoNewWindow -Wait -PassThru -RedirectStandardError "$env:TEMP\ffmpeg_extract.txt"
+            if ($AddTimestamp) {
+                # Calculate actual date/time from video file creation date + offset
+                $videoCreationTime = $selectedVideo.File.CreationTime
+                $actualDateTime = $videoCreationTime.AddSeconds($extractStart)
+                $timestampText = $actualDateTime.ToString("yyyy-MM-dd HH:mm:ss")
+                
+                # Escape special characters for ffmpeg drawtext filter
+                # Colons, backslashes, and single quotes need escaping
+                $timestampText = $timestampText.Replace('\', '\\').Replace("'", "\'").Replace(':', '\:')
+                
+                # Add drawtext filter for timestamp in lower right corner
+                # White text with black shadow for readability
+                $videoFilter += ",drawtext=text='$timestampText':fontcolor=white:fontsize=24:box=1:boxcolor=black@0.5:boxborderw=5:x=w-tw-10:y=h-th-10"
+            }
             
-            if ($proc.ExitCode -ne 0 -or -not (Test-Path $clipFile)) {
+            # Use batch file to avoid PowerShell argument escaping issues with complex filters
+            $extractBatchFile = Join-Path $env:TEMP "ffmpeg_extract_$(Get-Date -Format 'yyyyMMdd_HHmmss').cmd"
+            $extractErrorLog = Join-Path $env:TEMP "ffmpeg_extract.txt"
+            
+            $batchContent = "@echo off`r`n"
+            $batchContent += "ffmpeg -y"
+            $batchContent += " -ss $($extractStart.ToString($ci))"
+            $batchContent += " -i `"$($selectedVideo.File.FullName)`""
+            $batchContent += " -t $($extractDuration.ToString($ci))"
+            $batchContent += " -vf `"$videoFilter`""
+            $batchContent += " -c:v libx264"
+            $batchContent += " -preset faster"
+            $batchContent += " -crf 15"
+            $batchContent += " -an"
+            $batchContent += " `"$clipFile`""
+            $batchContent += " 2> `"$extractErrorLog`""
+            
+            Set-Content -Path $extractBatchFile -Value $batchContent -Encoding ASCII
+            
+            & cmd /c $extractBatchFile
+            $exitCode = $LASTEXITCODE
+            
+            Remove-Item $extractBatchFile -ErrorAction SilentlyContinue
+            
+            if ($exitCode -ne 0 -or -not (Test-Path $clipFile)) {
+                if (Test-Path $extractErrorLog) {
+                    $errorContent = Get-Content $extractErrorLog -Raw
+                    Write-Warning "FFmpeg extraction error: $($errorContent.Substring(0, [Math]::Min(500, $errorContent.Length)))"
+                }
                 Write-Warning "Failed to extract clip #$clipCounter"
                 break
             }
@@ -1008,8 +1022,6 @@ try {
             # Update tracking
             $videoTimePositions[$selectedVideo.Name] = $actualEndTime
             $previousClipEndGps = Get-NearestGpsPoint -GpsPoints $selectedVideo.GpsPoints -TargetTime $actualEndTime
-            $previousClipVideo = $selectedVideo
-            $previousClipEndTime = $actualEndTime
             
             Write-Verbose "  ✓ Clip end GPS: ($($previousClipEndGps.lat.ToString('N6')), $($previousClipEndGps.lon.ToString('N6'))) at t=$($actualEndTime.ToString('N2'))s"
             
@@ -1054,6 +1066,9 @@ try {
         
         Write-Host "  Merging clip #$i/$($extractedClips.Count - 1)..." -NoNewline
         
+        # Keep track of previous merge file to delete after successful merge
+        $previousMergePath = $currentVideoPath
+        
         try {
             $mergeResult = Merge-VideosWithCrossfade `
                 -VideoA $currentVideoPath -DurationA $currentDuration `
@@ -1065,6 +1080,12 @@ try {
             $currentDuration = $mergeResult.Dur
             
             Write-Host " ✓ Total: $($currentDuration.ToString('N1'))s" -ForegroundColor Green
+            
+            # Delete the previous merge file to save disk space (but not if it's a clip)
+            if ($i -gt 1 -and $previousMergePath -like "*$tempMergeDir*") {
+                Remove-Item -LiteralPath $previousMergePath -Force -ErrorAction SilentlyContinue
+                Write-Verbose "  Deleted previous merge: $(Split-Path $previousMergePath -Leaf)"
+            }
         } catch {
             Write-Error "Failed to merge clip #$i`: $($_.Exception.Message)"
             throw

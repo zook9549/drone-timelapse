@@ -16,7 +16,7 @@
 
 .PARAMETER ClipLengthSec
     Target clip length in seconds for evaluation. Default is 5 seconds.
-
+asf 
 .PARAMETER MasterVideo
     Name of the video file to use as master reference (e.g., 'video1.mp4').
     If not specified, uses the first video by date/time.
