@@ -82,7 +82,10 @@ param(
     [string]$MasterVideo,
 
     [Parameter(HelpMessage = "Add timestamp watermark in lower right corner of each clip")]
-    [switch]$AddTimestamp
+    [switch]$AddTimestamp,
+
+    [Parameter(HelpMessage = "Force regeneration even if output video is up-to-date")]
+    [switch]$Force
 )
 
 #Requires -Version 7.0
@@ -112,7 +115,7 @@ $Script:Config = @{
     
     # Audio settings
     AudioFadeInDuration   = 2.0     # Audio fade in duration (seconds)
-    AudioFadeOutDuration  = 2.0     # Audio fade out duration (seconds)
+    AudioFadeOutDuration  = 5.0     # Audio fade out duration (seconds)
     AudioBitrate          = '192k'  # Audio encoding bitrate
     
     # Video encoding
@@ -688,7 +691,37 @@ try {
         throw "No valid video files with GPS data found."
     }
     
+    # Check for master SRT file if no MasterVideo specified
+    $masterSrtFile = $null
+    if (-not $MasterVideo) {
+        $folderName = Split-Path $InputFolder -Leaf
+        $masterSrtPath = Join-Path $InputFolder "$folderName.srt"
+        
+        if (Test-Path $masterSrtPath) {
+            Write-Host "`nFound master SRT file: $folderName.srt" -ForegroundColor Cyan
+            try {
+                $masterGpsPoints = Get-SrtGpsPoints -SrtPath $masterSrtPath
+                
+                # Create a pseudo-video metadata object for the master SRT
+                $masterSrtFile = [pscustomobject]@{
+                    File         = $null
+                    Name         = "$folderName (master SRT)"
+                    GpsPoints    = $masterGpsPoints
+                    Duration     = ($masterGpsPoints | Select-Object -Last 1).t
+                    EffectiveMax = ($masterGpsPoints | Select-Object -Last 1).t
+                }
+                
+                Write-Host "  Master SRT GPS points: $($masterGpsPoints.Count)" -ForegroundColor Gray
+                Write-Host "  Duration: $($masterSrtFile.Duration.ToString('N1'))s" -ForegroundColor Gray
+            } catch {
+                Write-Warning "Failed to load master SRT file: $($_.Exception.Message)"
+                $masterSrtFile = $null
+            }
+        }
+    }
+    
     # Select master reference video
+    $masterVideoWasAutoSelected = $false
     if ($MasterVideo) {
         Write-Verbose "Looking for specified master video: $MasterVideo"
         
@@ -722,10 +755,61 @@ try {
             throw "Master video not found: $searchName"
         }
         Write-Host "`nUsing specified master reference: $($selectedMasterVideo.Name)" -ForegroundColor Cyan
+    } elseif ($masterSrtFile) {
+        # Use master SRT file as reference
+        $selectedMasterVideo = $masterSrtFile
+        $masterVideoWasAutoSelected = $false
+        Write-Host "`nUsing master SRT file as GPS reference: $($selectedMasterVideo.Name)" -ForegroundColor Cyan
     } else {
         # Use first video (by date/time) as master reference
         $selectedMasterVideo = $videoMetadata[0]
+        $masterVideoWasAutoSelected = $true
         Write-Host "`nUsing first video as master reference: $($selectedMasterVideo.Name)" -ForegroundColor Cyan
+    }
+    
+    # Update build.bat if master video was auto-selected
+    if ($masterVideoWasAutoSelected) {
+        $buildBatPath = Join-Path $scriptPath "build.bat"
+        if (Test-Path $buildBatPath) {
+            Write-Verbose "Checking if build.bat needs updating..."
+            
+            try {
+                $buildContent = Get-Content -Path $buildBatPath -Raw
+                $inputFolderNormalized = $InputFolder.Replace('\', '/')
+                
+                # Look for timelapse.ps1 command with this InputFolder
+                $pattern = "(?m)^(pwsh\.exe\s+timelapse\.ps1\s+[^`r`n]*-InputFolder\s+`"?$([regex]::Escape($inputFolderNormalized))`"?)([^`r`n]*)$"
+                
+                if ($buildContent -match $pattern) {
+                    $commandLine = $Matches[0]
+                    Write-Verbose "Found matching command in build.bat"
+                    
+                    # Check if it has a -MasterVideo parameter
+                    if ($commandLine -match '-MasterVideo\s+"([^"]+)"') {
+                        $currentMaster = $Matches[1]
+                        if ($currentMaster -ne $selectedMasterVideo.Name) {
+                            Write-Host "  Updating build.bat master video: $currentMaster → $($selectedMasterVideo.Name)" -ForegroundColor Yellow
+                            
+                            # Replace the master video value
+                            $updatedCommand = $commandLine -replace '(-MasterVideo\s+)"[^"]+"', "`$1`"$($selectedMasterVideo.Name)`""
+                            $buildContent = $buildContent.Replace($commandLine, $updatedCommand)
+                            
+                            # Write back to file
+                            Set-Content -Path $buildBatPath -Value $buildContent -NoNewline
+                            Write-Verbose "  ✓ build.bat updated"
+                        } else {
+                            Write-Verbose "  build.bat already has correct master video"
+                        }
+                    } else {
+                        Write-Verbose "  Command found but no -MasterVideo parameter to update"
+                    }
+                } else {
+                    Write-Verbose "  No matching command found in build.bat for this InputFolder"
+                }
+            } catch {
+                Write-Warning "Failed to update build.bat: $($_.Exception.Message)"
+            }
+        }
     }
     
     # Validate master video has required data
@@ -756,6 +840,56 @@ try {
     $outputFile = Join-Path $outputFolder "$outputBaseName.mp4"
     
     Write-Host "Output file: $outputFile"
+    
+    # ============================================================================
+    # CHECK IF REGENERATION IS NEEDED
+    # ============================================================================
+    
+    if (-not $Force -and (Test-Path $outputFile)) {
+        Write-Host "`nChecking if regeneration is needed..." -ForegroundColor Cyan
+        
+        $outputLastWrite = (Get-Item $outputFile).LastWriteTime
+        Write-Verbose "Output video timestamp: $outputLastWrite"
+        
+        # Check if any input videos are newer
+        $newerVideos = $videoMetadata | Where-Object { $_.File.LastWriteTime -gt $outputLastWrite }
+        
+        # Check if script files are newer
+        $thisScriptPath = $MyInvocation.MyCommand.Path
+        $gpsScriptPath = Join-Path $scriptPath "GpsScoring.ps1"
+        
+        $thisScriptNewer = (Test-Path $thisScriptPath) -and ((Get-Item $thisScriptPath).LastWriteTime -gt $outputLastWrite)
+        $gpsScriptNewer = (Test-Path $gpsScriptPath) -and ((Get-Item $gpsScriptPath).LastWriteTime -gt $outputLastWrite)
+        
+        if ($newerVideos.Count -eq 0 -and -not $thisScriptNewer -and -not $gpsScriptNewer) {
+            Write-Host "✓ Output video is up-to-date (no newer input videos or script changes)" -ForegroundColor Green
+            Write-Host "  Output: $outputLastWrite"
+            Write-Host "  Skipping regeneration. Use -Force to regenerate anyway."
+            return
+        }
+        
+        if ($newerVideos.Count -gt 0) {
+            Write-Host "  Found $($newerVideos.Count) video(s) newer than output:" -ForegroundColor Yellow
+            foreach ($v in $newerVideos | Select-Object -First 3) {
+                Write-Host "    - $($v.Name): $($v.File.LastWriteTime)" -ForegroundColor Gray
+            }
+            if ($newerVideos.Count -gt 3) {
+                Write-Host "    ... and $($newerVideos.Count - 3) more" -ForegroundColor Gray
+            }
+        }
+        
+        if ($thisScriptNewer) {
+            Write-Host "  timelapse.ps1 modified: $((Get-Item $thisScriptPath).LastWriteTime)" -ForegroundColor Yellow
+        }
+        
+        if ($gpsScriptNewer) {
+            Write-Host "  GpsScoring.ps1 modified: $((Get-Item $gpsScriptPath).LastWriteTime)" -ForegroundColor Yellow
+        }
+        
+        Write-Host "  Proceeding with regeneration..."
+    } elseif ($Force) {
+        Write-Verbose "Force flag set, regenerating regardless of timestamps"
+    }
     
     # Create temporary directories
     $tempClipsDir = Join-Path $InputFolder '_temp_clips'
@@ -810,20 +944,20 @@ try {
         
         # Determine target GPS coordinates
         if ($clipCounter -eq 0) {
-            # First clip: use master timeline
+            # First clip: use master timeline for both start and end
             $targetStartPos = Get-NearestGpsPoint -GpsPoints $selectedMasterVideo.GpsPoints -TargetTime $masterTimePosition
             $targetEndTime = [Math]::Min($masterTimePosition + $ClipLengthSec, $totalDuration)
             $targetEndPos = Get-NearestGpsPoint -GpsPoints $selectedMasterVideo.GpsPoints -TargetTime $targetEndTime
             
             Write-Host "`nClip #1 (from master): GPS Start($($targetStartPos.lat.ToString('N6')), $($targetStartPos.lon.ToString('N6'))) End($($targetEndPos.lat.ToString('N6')), $($targetEndPos.lon.ToString('N6')))"
         } else {
-            # Subsequent clips: use master video timeline to prevent error cascading
+            # Subsequent clips: START matches previous clip's end (smooth transition)
+            # But END uses master timeline (stay on intended path)
             $targetStartPos = $previousClipEndGps
-            # Calculate target end time from master timeline (not previous clip's video)
             $targetEndTime = [Math]::Min($masterTimePosition + $ClipLengthSec, $totalDuration)
             $targetEndPos = Get-NearestGpsPoint -GpsPoints $selectedMasterVideo.GpsPoints -TargetTime $targetEndTime
             
-            Write-Host "`nClip #$($clipCounter + 1) (from master timeline): GPS Start($($targetStartPos.lat.ToString('N6')), $($targetStartPos.lon.ToString('N6'))) End($($targetEndPos.lat.ToString('N6')), $($targetEndPos.lon.ToString('N6')))"
+            Write-Host "`nClip #$($clipCounter + 1): GPS Start($($targetStartPos.lat.ToString('N6')), $($targetStartPos.lon.ToString('N6'))) End(master: $($targetEndPos.lat.ToString('N6')), $($targetEndPos.lon.ToString('N6')))"
         }
         
         # Round-robin video selection
@@ -913,6 +1047,21 @@ try {
                 continue
             }
             
+            # For clips after first, check if we have enough lead-in time for the fade
+            if ($clipCounter -gt 0) {
+                $availableLeadIn = $extractStart
+                $desiredLeadIn = $FadeDurationSec
+                
+                if ($availableLeadIn -lt $desiredLeadIn) {
+                    # Not enough lead-in time - this match is too close to video start
+                    # Skip this video and try next in round-robin
+                    Write-Verbose "    Insufficient lead-in time ($($availableLeadIn.ToString('N2'))s < $($desiredLeadIn.ToString('N2'))s) at GPS match position"
+                    $roundRobinIndex++
+                    $triesRemaining--
+                    continue
+                }
+            }
+            
             $foundVideo = $true
             $selectedVideo = $vmeta
             $lastUsedVideoIndex = $currentIndex
@@ -939,9 +1088,9 @@ try {
             $roundRobinIndex = ($lastUsedVideoIndex + 1) % $videoMetadata.Count
         }
         
-        # Adjust for fade overlap on subsequent clips
+        # Adjust for fade overlap on subsequent clips (now after video selection is complete)
         if ($clipCounter -gt 0) {
-            $extractStart = [Math]::Max(0, $extractStart - $FadeDurationSec)
+            $extractStart = $extractStart - $FadeDurationSec
             $extractDuration = $extractDuration + $FadeDurationSec
         }
         
@@ -961,9 +1110,38 @@ try {
             $videoFilter = "fps=$Fps,format=yuv420p,setsar=1"
             
             if ($AddTimestamp) {
-                # Calculate actual date/time from video file creation date + offset
-                $videoCreationTime = $selectedVideo.File.CreationTime
-                $actualDateTime = $videoCreationTime.AddSeconds($extractStart)
+                # Calculate actual date/time from video filename (DJI format) or file creation date
+                $actualDateTime = $null
+                $timestampSource = "unknown"
+                
+                # Try to parse DJI filename format: DJI_YYYYMMDDHHMMSS_*
+                if ($selectedVideo.Name -match 'DJI_(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})') {
+                    try {
+                        $year = [int]$Matches[1]
+                        $month = [int]$Matches[2]
+                        $day = [int]$Matches[3]
+                        $hour = [int]$Matches[4]
+                        $minute = [int]$Matches[5]
+                        $second = [int]$Matches[6]
+                        
+                        $videoStartTime = Get-Date -Year $year -Month $month -Day $day -Hour $hour -Minute $minute -Second $second
+                        $actualDateTime = $videoStartTime.AddSeconds($extractStart)
+                        $timestampSource = "DJI filename"
+                        Write-Verbose "  Timestamp from DJI filename: $($videoStartTime.ToString('yyyy-MM-dd HH:mm:ss')) + $($extractStart.ToString('N2'))s = $($actualDateTime.ToString('yyyy-MM-dd HH:mm:ss'))"
+                    } catch {
+                        Write-Warning "Failed to parse DJI timestamp from filename: $($selectedVideo.Name) - Error: $($_.Exception.Message)"
+                        $actualDateTime = $null
+                    }
+                }
+                
+                # Fallback to file creation time if filename parsing failed
+                if (-not $actualDateTime) {
+                    $videoCreationTime = $selectedVideo.File.CreationTime
+                    $actualDateTime = $videoCreationTime.AddSeconds($extractStart)
+                    $timestampSource = "File.CreationTime"
+                    Write-Warning "  Timestamp from File.CreationTime (fallback): $($videoCreationTime.ToString('yyyy-MM-dd HH:mm:ss')) + $($extractStart.ToString('N2'))s = $($actualDateTime.ToString('yyyy-MM-dd HH:mm:ss'))"
+                }
+                
                 $timestampText = $actualDateTime.ToString("yyyy-MM-dd HH:mm:ss")
                 
                 # Escape special characters for ffmpeg drawtext filter

@@ -17,10 +17,10 @@ $Script:ScoringConfig = @{
     
     # Duration flexibility
     MinDurationMultiplier  = 0.5     # Minimum duration as fraction of target (50%)
-    MaxDurationMultiplier  = 1.5     # Maximum duration as fraction of target (150%)
+    MaxDurationMultiplier  = 2.0     # Maximum duration as fraction of target (150%)
     
     # Start point precision threshold (stricter than end point)
-    StartDistanceMultiplier = 0.8    # Start must be within 50% of max distance
+    StartDistanceMultiplier = 0.6    # Start must be within 50% of max distance
     
     # GPS coordinate validation
     MinLatitude            = -90.0

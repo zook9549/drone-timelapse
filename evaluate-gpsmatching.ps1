@@ -90,7 +90,10 @@ param(
     [string]$OutputCsv,
 
     [Parameter(HelpMessage = "Show all matches including poor ones")]
-    [switch]$ShowAll
+    [switch]$ShowAll,
+
+    [Parameter(HelpMessage = "Generate optimal GPS path SRT file by averaging all videos")]
+    [switch]$GenerateOptimalPath
 )
 
 #Requires -Version 7.0
@@ -977,7 +980,7 @@ if ($unusableVideos.Count -gt 0) {
 
 # Show detailed breakdown for top matches
 Write-Host "`n=== Top 10 Best Matches (Detailed Breakdown) ===" -ForegroundColor Cyan
-$topMatches = $filteredEvals | Sort-Object TotalScore | Select-Object -First 10
+$topMatches = $filteredEvals | Where-Object { $_.TotalScore -ge 0 } | Sort-Object TotalScore | Select-Object -First 10
 
 foreach ($match in $topMatches) {
     Write-Host "`nMatch Score: $($match.TotalScore.ToString('N1')) [$($match.Rating)]" -ForegroundColor Green
@@ -1012,6 +1015,135 @@ if ($OutputCsv) {
     Write-Host "`n=== Exporting Results ===" -ForegroundColor Cyan
     $filteredEvals | Export-Csv -Path $OutputCsv -NoTypeInformation
     Write-Host "Results exported to: $OutputCsv" -ForegroundColor Green
+}
+
+# ============================================================================
+# GENERATE OPTIMAL PATH
+# ============================================================================
+
+if ($GenerateOptimalPath) {
+    Write-Host "`n=== Generating Optimal GPS Path ===" -ForegroundColor Cyan
+    Write-Host "Creating consensus path by averaging GPS coordinates from all videos`n"
+    
+    $outputBaseName = Split-Path $InputFolder -Leaf
+    $optimalSrtPath = Join-Path $InputFolder "$outputBaseName.srt"
+    
+    try {
+        # Determine time range across all videos
+        $minTime = ($videos | ForEach-Object { $_.MinTime } | Measure-Object -Minimum).Minimum
+        $maxTime = ($videos | ForEach-Object { $_.MaxTime } | Measure-Object -Maximum).Maximum
+        
+        Write-Host "  Time range: $($minTime.ToString('N2'))s - $($maxTime.ToString('N2'))s" -ForegroundColor Gray
+        
+        # Create time buckets (1 second intervals)
+        $timeInterval = 1.0
+        $optimalPoints = New-Object System.Collections.Generic.List[object]
+        
+        $currentTime = $minTime
+        $pointsProcessed = 0
+        
+        while ($currentTime -le $maxTime) {
+            # Collect GPS points from all videos near this time (within 0.5s)
+            $nearbyPoints = New-Object System.Collections.Generic.List[object]
+            
+            foreach ($vmeta in $videos) {
+                # Find closest GPS point in this video at current time
+                $closestPoint = $null
+                $minTimeDiff = [double]::MaxValue
+                
+                foreach ($gpsPoint in $vmeta.GpsPoints) {
+                    $timeDiff = [Math]::Abs($gpsPoint.t - $currentTime)
+                    if ($timeDiff -lt $minTimeDiff -and $timeDiff -le 0.5) {
+                        $minTimeDiff = $timeDiff
+                        $closestPoint = $gpsPoint
+                    }
+                }
+                
+                if ($closestPoint) {
+                    $nearbyPoints.Add($closestPoint)
+                }
+            }
+            
+            # Calculate average/centroid position from all nearby points
+            if ($nearbyPoints.Count -gt 0) {
+                $avgLat = ($nearbyPoints | Measure-Object -Property lat -Average).Average
+                $avgLon = ($nearbyPoints | Measure-Object -Property lon -Average).Average
+                
+                $optimalPoints.Add([pscustomobject]@{
+                    t = $currentTime
+                    lat = $avgLat
+                    lon = $avgLon
+                    sourceCount = $nearbyPoints.Count
+                })
+                $pointsProcessed++
+            }
+            
+            $currentTime += $timeInterval
+        }
+        
+        Write-Host "  Generated $($optimalPoints.Count) optimal GPS points" -ForegroundColor Green
+        
+        # Write SRT file
+        Write-Host "  Writing SRT file..." -ForegroundColor Gray
+        $srtContent = New-Object System.Text.StringBuilder
+        
+        for ($i = 0; $i -lt $optimalPoints.Count; $i++) {
+            $point = $optimalPoints[$i]
+            
+            # SRT entry number
+            $srtContent.AppendLine(($i + 1).ToString()) | Out-Null
+            
+            # Calculate timestamps
+            $startTime = $point.t
+            $endTime = if ($i -lt $optimalPoints.Count - 1) { $optimalPoints[$i + 1].t } else { $startTime + $timeInterval }
+            
+            # Format timestamps as HH:MM:SS,mmm
+            $startHours = [int][Math]::Floor($startTime / 3600)
+            $startMinutes = [int][Math]::Floor(($startTime % 3600) / 60)
+            $startSeconds = [int][Math]::Floor($startTime % 60)
+            $startMilliseconds = [int][Math]::Floor(($startTime % 1) * 1000)
+            
+            $endHours = [int][Math]::Floor($endTime / 3600)
+            $endMinutes = [int][Math]::Floor(($endTime % 3600) / 60)
+            $endSeconds = [int][Math]::Floor($endTime % 60)
+            $endMilliseconds = [int][Math]::Floor(($endTime % 1) * 1000)
+            
+            $timelineStr = "{0:D2}:{1:D2}:{2:D2},{3:D3} --> {4:D2}:{5:D2}:{6:D2},{7:D3}" -f `
+                $startHours, $startMinutes, $startSeconds, $startMilliseconds, `
+                $endHours, $endMinutes, $endSeconds, $endMilliseconds
+            
+            $srtContent.AppendLine($timelineStr) | Out-Null
+            
+            # GPS coordinates in standard format
+            $coordStr = "latitude: {0:F6} longitude: {1:F6}" -f $point.lat, $point.lon
+            $srtContent.AppendLine($coordStr) | Out-Null
+            
+            # Blank line between entries
+            $srtContent.AppendLine() | Out-Null
+        }
+        
+        # Write to file
+        Set-Content -Path $optimalSrtPath -Value $srtContent.ToString() -Encoding UTF8
+        
+        Write-Host "`n  ✓ Optimal path SRT saved: $optimalSrtPath" -ForegroundColor Green
+        Write-Host "  Contains $($optimalPoints.Count) GPS points averaged from $($videos.Count) video(s)" -ForegroundColor Cyan
+        
+        $avgSourceCount = ($optimalPoints | Measure-Object -Property sourceCount -Average).Average
+        Write-Host "  Average $($avgSourceCount.ToString('N1')) videos contributing per point" -ForegroundColor Cyan
+        
+        # Show quality statistics
+        $singleSourcePoints = ($optimalPoints | Where-Object { $_.sourceCount -eq 1 }).Count
+        $multiSourcePoints = ($optimalPoints | Where-Object { $_.sourceCount -gt 1 }).Count
+        $maxSources = ($optimalPoints | Measure-Object -Property sourceCount -Maximum).Maximum
+        
+        Write-Host "`n  Quality Metrics:" -ForegroundColor Gray
+        Write-Host "    Points with 1 video:  $singleSourcePoints ($([Math]::Round(100 * $singleSourcePoints / $optimalPoints.Count, 1))%)" -ForegroundColor $(if ($singleSourcePoints -gt $multiSourcePoints) { "Yellow" } else { "Gray" })
+        Write-Host "    Points with 2+ videos: $multiSourcePoints ($([Math]::Round(100 * $multiSourcePoints / $optimalPoints.Count, 1))%)" -ForegroundColor $(if ($multiSourcePoints -gt $singleSourcePoints) { "Green" } else { "Gray" })
+        Write-Host "    Maximum sources/point: $maxSources" -ForegroundColor Gray
+        
+    } catch {
+        Write-Warning "Failed to generate optimal path SRT: $($_.Exception.Message)"
+    }
 }
 
 Write-Host "`n=== Evaluation Complete ===" -ForegroundColor Green

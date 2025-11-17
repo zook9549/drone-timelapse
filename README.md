@@ -9,6 +9,14 @@ This toolset enables you to:
 - **Upload videos to YouTube** with automatic replacement of existing videos
 - **Upload videos to Amazon S3** for archival or CDN distribution
 
+## Example Output
+
+Here's an example timelapse video created using these scripts from multiple drone flights:
+
+**[View Example Video](https://fenton-property.s3.us-east-1.amazonaws.com/full.mp4)**
+
+This timelapse was generated from 15+ separate drone flights, each following the same GPS waypoint path. The script automatically synchronized the GPS coordinates across all flights and created smooth crossfade transitions between clips extracted in round-robin fashion.
+
 ## Requirements
 
 ### Software
@@ -54,6 +62,9 @@ Creates GPS-synchronized timelapse videos from multiple drone flights that follo
 # Add timestamp watermark to clips
 .\timelapse.ps1 -InputFolder "C:\DroneFootage\Flight01" -AddTimestamp
 
+# Force regeneration even if output is up-to-date
+.\timelapse.ps1 -InputFolder "C:\DroneFootage\Flight01" -Force
+
 # Keep temporary files for debugging
 .\timelapse.ps1 -InputFolder "C:\DroneFootage\Flight01" -KeepTemps
 
@@ -74,6 +85,7 @@ Creates GPS-synchronized timelapse videos from multiple drone flights that follo
 | `Fps` | Integer | 30 | Output video frame rate (15-60) |
 | `MasterVideo` | String | *first video* | Name of video file to use as GPS timeline reference (e.g., 'GX010123.mp4') |
 | `AddTimestamp` | Switch | False | Add timestamp watermark in lower right corner of each clip |
+| `Force` | Switch | False | Force regeneration even if output video is up-to-date |
 | `KeepTemps` | Switch | False | Keep temporary files after processing |
 
 #### Input Requirements
@@ -98,6 +110,19 @@ To add background music:
 The script creates:
 - **Final video** - Named after the input folder (e.g., `Flight01.mp4`)
 - **Location** - Saved in the parent directory of your input folder
+
+#### Smart Regeneration
+
+The script automatically checks timestamps to avoid unnecessary regeneration:
+- **Skips processing** if output video exists and is newer than:
+  - All input video files
+  - `timelapse.ps1` script
+  - `GpsScoring.ps1` script
+- **Regenerates automatically** when:
+  - New or updated video files are added
+  - Script files are modified
+  - `-Force` flag is used
+- **Saves time** on repeated runs with unchanged inputs
 
 ---
 
